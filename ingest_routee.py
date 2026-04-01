@@ -237,7 +237,7 @@ def build_bronze_layer(workers: int = 1) -> pl.DataFrame:
 def _nearest_heading(content: str, char_pos: int) -> str:
     """Find the nearest markdown heading at or before char_pos."""
     import re
-    pattern = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
+    pattern = re.compile(r"^\s*(#{1,3})\s+(.+)$", re.MULTILINE)
     heading = "Introduction"
     for m in pattern.finditer(content):
         if m.start() <= char_pos:
