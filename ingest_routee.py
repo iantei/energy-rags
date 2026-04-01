@@ -5,6 +5,7 @@ Run once to add RouteE docs to the existing ChromaDB vector store:
 """
 
 from pathlib import Path
+
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import TextLoader
 from langchain_community.vectorstores import Chroma
@@ -42,6 +43,7 @@ CHUNK_OVERLAP = 150
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
+
 
 def load_file(path: Path, source_label: str) -> list[Document]:
     """Load a single file and tag it with source metadata."""

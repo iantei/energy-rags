@@ -4,18 +4,11 @@ Energy Policy RAG — Gradio Interface (Gradio 6 compatible)
 
 import gradio as gr
 from pathlib import Path
+from pydantic import ValidationError
 from src.rag_pipeline import build_rag_chain, query, ingest, CHROMA_DIR, DATA_DIR
 
 _chain = None
 _retriever = None
-
-EXAMPLE_QUESTIONS = [
-    "What are the key barriers to electrifying on-demand transit fleets?",
-    "How does charging infrastructure availability affect EV adoption rates?",
-    "What grid impacts are projected from large-scale EV fleet deployment?",
-    "What vehicle classes are most suitable for near-term electrification?",
-    "Summarize the findings on charging demand at the national scale.",
-]
 
 
 def ensure_chain():
@@ -27,13 +20,14 @@ def ensure_chain():
     return True
 
 
-def format_sources_md(sources):
-    if not sources:
+def format_sources_md(response) -> str:
+    if not response.sources:
         return "_No sources retrieved._"
-    lines = ["| # | Document | Page | Snippet |", "|---|----------|------|---------|"]
-    for i, s in enumerate(sources, 1):
-        snippet = s["snippet"].replace("\n", " ").replace("|", "/")[:120] + "..."
-        lines.append(f"| {i} | `{s['file']}` | {s['page']} | {snippet} |")
+    lines = ["| # | Document | Page | Project | Snippet |",
+             "|---|----------|------|---------|---------|"]
+    for i, s in enumerate(response.sources, 1):
+        snippet = s.snippet.replace("\n", " ").replace("|", "/")[:100] + "..."
+        lines.append(f"| {i} | `{s.file}` | {s.page} | {s.project} | {snippet} |")
     return "\n".join(lines)
 
 
@@ -62,10 +56,15 @@ def ask_question(question, history):
         return history, "", "_Run ingestion first._"
 
     try:
-        answer, sources = query(question, _chain, _retriever)
+        response = query(question, _chain, _retriever)
+        history.append({"role": "user", "content": response.question})
+        history.append({"role": "assistant", "content": response.answer})
+        return history, "", format_sources_md(response)
+    except ValidationError as e:
+        msg = f"Invalid input: {e.errors()[0]['msg']}"
         history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": answer})
-        return history, "", format_sources_md(sources)
+        history.append({"role": "assistant", "content": msg})
+        return history, "", "_Validation error._"
     except Exception as e:
         history.append({"role": "user", "content": question})
         history.append({"role": "assistant", "content": f"Error: {e}"})
@@ -76,8 +75,8 @@ with gr.Blocks(title="Energy Policy RAG Assistant") as demo:
 
     gr.Markdown("""
     # Energy Policy RAG Assistant
-    **Ask research questions over NREL & DOE technical reports.**
-    Powered by OpenAI embeddings + ChromaDB + GPT-4o-mini.
+    **Ask research questions over NREL & DOE technical reports and RouteE Compass docs.**
+    Powered by OpenAI embeddings + ChromaDB + GPT-4o-mini. Schema validated with Pydantic.
     """)
 
     with gr.Tabs():
@@ -88,7 +87,7 @@ with gr.Blocks(title="Energy Policy RAG Assistant") as demo:
                     chatbot = gr.Chatbot(label="Conversation", height=460)
                     with gr.Row():
                         question_box = gr.Textbox(
-                            placeholder="e.g. What are the grid impacts of large-scale EV fleet deployment?",
+                            placeholder="e.g. How do I configure energy weights in RouteE Compass?",
                             label="Your question",
                             lines=2,
                             scale=5,
@@ -133,15 +132,20 @@ with gr.Blocks(title="Energy Policy RAG Assistant") as demo:
             gr.Markdown("""
             ### Architecture
             ```
-            PDFs -> PyPDFLoader -> RecursiveCharacterTextSplitter
-                 -> OpenAI text-embedding-3-small -> ChromaDB (local)
-                 -> MMR Retriever (k=5) -> GPT-4o-mini -> Answer + Citations
+            PDFs + Markdown -> PyPDFLoader/TextLoader -> RecursiveCharacterTextSplitter
+                            -> OpenAI text-embedding-3-small -> ChromaDB (local)
+                            -> MMR Retriever (k=5) -> GPT-4o-mini
+                            -> Pydantic RAGResponse -> Answer + Citations
             ```
             ### Stack
-            - LangChain: orchestration
-            - ChromaDB: local persistent vector store
-            - OpenAI: embeddings (text-embedding-3-small) + LLM (GPT-4o-mini)
-            - Gradio: UI
+            - **LangChain** — orchestration
+            - **ChromaDB** — local persistent vector store
+            - **OpenAI** — embeddings + LLM (GPT-4o-mini)
+            - **Pydantic** — query validation and response schema enforcement
+            - **Gradio** — UI
+            ### Corpus
+            - NREL technical reports (PDF)
+            - RouteE Compass documentation (Markdown + Python examples)
             """)
 
 
