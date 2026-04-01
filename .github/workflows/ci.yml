@@ -9,6 +9,7 @@ on:
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -29,19 +30,21 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          # Install without Docling in CI (too heavy for CI runner)
+          # Docling falls back gracefully to PyPDF in tests
+          grep -v "^docling" requirements.txt | pip install -r /dev/stdin
           pip install ruff mypy pytest
 
       - name: Lint with ruff
-        run: ruff check src/ ingest_routee.py
+        run: ruff check src/ ingest_routee.py app.py
 
       - name: Format check with ruff
-        run: ruff format --check src/ ingest_routee.py
+        run: ruff format --check src/ ingest_routee.py app.py
 
       - name: Type check with mypy
-        run: mypy src/rag_pipeline.py --ignore-missing-imports
+        run: mypy src/models.py src/rag_pipeline.py --ignore-missing-imports
 
-      - name: Run tests
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: Run unit tests
+        # Tests are fully offline — no OpenAI key needed
+        # Pydantic model tests + Silver layer chunking tests
         run: pytest tests/ -v --tb=short

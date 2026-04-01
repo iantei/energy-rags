@@ -1,209 +1,144 @@
 """
-Energy Policy RAG Pipeline
---------------------------
-Ingests NREL/DOE PDF reports and RouteE Compass docs, builds a ChromaDB
-vector store, and answers researcher questions with source citations.
+src/rag_pipeline.py — Core RAG chain and query logic.
 
-Pydantic models enforce schema integrity at query input and response output,
-mirroring the data quality patterns used in production NREL analytical workflows.
+Responsibilities:
+    - Load ChromaDB vectorstore
+    - Build LangChain RAG chain (Cloud or Local backend)
+    - Execute validated queries and return RAGResponse
+
+Pydantic models live in src/models.py and are re-exported here
+for backward compatibility with existing imports.
 """
 
+import logging
 from pathlib import Path
 from typing import Any
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from pydantic import BaseModel, Field, field_validator, model_validator
 
-# ── Configuration ──────────────────────────────────────────────────────────────
+# Re-export all models for backward compatibility
+# (existing code that does `from src.rag_pipeline import PipelineConfig` still works)
+from src.models import (  # noqa: F401
+    BronzeRecord,
+    PipelineConfig,
+    RAGQuery,
+    RAGResponse,
+    SilverRecord,
+    SourceChunk,
+)
 
-DATA_DIR = Path(__file__).parent.parent / "data" / "pdfs"
-CHROMA_DIR = Path(__file__).parent.parent / "data" / "chroma_db"
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+log = logging.getLogger(__name__)
+
+# ── Path configuration ─────────────────────────────────────────────────────────
+
+PROJECT_ROOT = Path(__file__).parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+CHROMA_DIR = DATA_DIR / "chroma_db"
+CHROMA_COLLECTION = "energy_reports_v2"
+
+# ── Validated singleton config ─────────────────────────────────────────────────
+# Validated at import time — raises immediately if misconfigured
+
+CONFIG = PipelineConfig()
+
+# ── System prompt ──────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a research assistant specializing in energy systems, \
-EV infrastructure, and transportation electrification. You answer questions \
-using only the provided context from NREL and DOE technical reports.
+EV infrastructure, and transportation electrification at a national laboratory. \
+You answer questions using ONLY the provided context from NREL and DOE technical \
+reports and the RouteE Compass codebase.
 
 Guidelines:
-- Be precise and cite the source document and page for every claim.
+- Be precise and cite the source document and section for every claim.
 - If the context does not contain enough information, say so clearly.
-- Use technical language appropriate for energy researchers.
+- Use technical language appropriate for energy researchers and engineers.
 - Prefer quantitative findings where available.
+- For code questions, include relevant code snippets from the context.
 
 Context:
 {context}
 """
 
+# ── Vectorstore ────────────────────────────────────────────────────────────────
 
-# ── Pydantic models ────────────────────────────────────────────────────────────
-
-
-class PipelineConfig(BaseModel):
-    """Validated pipeline configuration. Fails fast on invalid values."""
-
-    chunk_size: int = Field(default=800, gt=0, description="Token chunk size for splitting")
-    chunk_overlap: int = Field(default=150, ge=0, description="Overlap between chunks")
-    embedding_model: str = Field(default="text-embedding-3-small")
-    llm_model: str = Field(default="gpt-4o-mini")
-    retriever_k: int = Field(default=5, ge=1, le=20, description="Chunks to retrieve per query")
-    retriever_fetch_k: int = Field(default=15, ge=1, description="Candidates for MMR reranking")
-
-    @model_validator(mode="after")
-    def overlap_less_than_chunk(self) -> "PipelineConfig":
-        if self.chunk_overlap >= self.chunk_size:
-            raise ValueError(
-                f"chunk_overlap ({self.chunk_overlap}) must be less than "
-                f"chunk_size ({self.chunk_size})"
-            )
-        return self
-
-    @model_validator(mode="after")
-    def fetch_k_gte_k(self) -> "PipelineConfig":
-        if self.retriever_fetch_k < self.retriever_k:
-            raise ValueError(
-                f"retriever_fetch_k ({self.retriever_fetch_k}) must be >= "
-                f"retriever_k ({self.retriever_k})"
-            )
-        return self
-
-
-class RAGQuery(BaseModel):
-    """Validated query input."""
-
-    question: str = Field(..., min_length=1, description="Research question")
-    k: int | None = Field(default=None, ge=1, le=20, description="Override retriever_k")
-
-    @field_validator("question", mode="before")
-    @classmethod
-    def strip_and_check_empty(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError("Question must not be empty or whitespace only")
-        return v
-
-
-class SourceChunk(BaseModel):
-    """A single retrieved source chunk with metadata."""
-
-    file: str = Field(..., description="Source filename")
-    page: str = Field(..., description="Page number or '?' for non-PDF sources")
-    snippet: str = Field(..., description="Short excerpt from the chunk")
-    project: str = Field(default="unknown", description="Project tag from metadata")
-
-
-class RAGResponse(BaseModel):
-    """Structured RAG response with answer and cited sources."""
-
-    question: str
-    answer: str
-    sources: list[SourceChunk]
-
-    @property
-    def source_count(self) -> int:
-        return len(self.sources)
-
-    def format_sources_text(self) -> str:
-        lines = []
-        for i, s in enumerate(self.sources, 1):
-            lines.append(f"  [{i}] {s.file}, p.{s.page} ({s.project})")
-        return "\n".join(lines)
-
-
-# ── Pipeline config singleton ──────────────────────────────────────────────────
-
-# Validated once at import time — raises immediately if misconfigured
-CONFIG = PipelineConfig()
-
-
-# ── Document ingestion ─────────────────────────────────────────────────────────
-
-
-def load_pdfs(pdf_dir: Path = DATA_DIR) -> list[Document]:
-    """Load all PDFs from the data directory."""
-    docs = []
-    pdf_files = list(pdf_dir.glob("*.pdf"))
-    if not pdf_files:
-        raise FileNotFoundError(
-            f"No PDFs found in {pdf_dir}. Add NREL/DOE report PDFs to data/pdfs/ before ingesting."
-        )
-    for pdf_path in pdf_files:
-        print(f"  Loading: {pdf_path.name}")
-        loader = PyPDFLoader(str(pdf_path))
-        docs.extend(loader.load())
-    print(f"Loaded {len(docs)} pages from {len(pdf_files)} PDF(s).")
-    return docs
-
-
-def chunk_documents(docs: list[Document]) -> list[Document]:
-    """Split documents into overlapping chunks for embedding."""
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CONFIG.chunk_size,
-        chunk_overlap=CONFIG.chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
-    chunks = splitter.split_documents(docs)
-    print(f"Split into {len(chunks)} chunks.")
-    return chunks
-
-
-def build_vectorstore(chunks: list[Document]) -> Chroma:
-    """Embed chunks and persist to ChromaDB."""
-    print("Building vector store (this may take a minute)...")
-    embeddings = OpenAIEmbeddings(model=CONFIG.embedding_model)
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=str(CHROMA_DIR),
-        collection_name="energy_reports",
-    )
-    print(f"Vector store saved to {CHROMA_DIR}")
-    return vectorstore
-
-
-def ingest(pdf_dir: Path = DATA_DIR) -> Chroma:
-    """Full ingestion pipeline: load -> chunk -> embed -> persist."""
-    print("\n── Ingestion ──────────────────────────────────────────")
-    docs = load_pdfs(pdf_dir)
-    chunks = chunk_documents(docs)
-    return build_vectorstore(chunks)
-
-
-# ── RAG chain ──────────────────────────────────────────────────────────────────
-
-
-def load_vectorstore() -> Chroma:
-    """Load an existing persisted ChromaDB vector store."""
+def load_vectorstore(embedding_fn) -> Chroma:
+    """
+    Load ChromaDB with the given embedding function.
+    Called per query since Cloud and Local use different embedding models.
+    """
     if not CHROMA_DIR.exists():
-        raise FileNotFoundError("No vector store found. Run ingest() first.")
-    embeddings = OpenAIEmbeddings(model=CONFIG.embedding_model)
+        raise FileNotFoundError(
+            f"No vector store found at {CHROMA_DIR}. "
+            "Run `python ingest_routee.py` to build the corpus first."
+        )
     return Chroma(
         persist_directory=str(CHROMA_DIR),
-        embedding_function=embeddings,
-        collection_name="energy_reports",
+        embedding_function=embedding_fn,
+        collection_name=CHROMA_COLLECTION,
     )
 
 
+def vectorstore_ready() -> bool:
+    """Check if ChromaDB has been built."""
+    return CHROMA_DIR.exists()
+
+
+# ── Context formatter ─────────────────────────────────────────────────────────
+
 def format_context(docs: list[Document]) -> str:
-    """Format retrieved chunks with source metadata for the prompt."""
+    """Format retrieved chunks with source metadata for the LLM prompt."""
     parts = []
     for i, doc in enumerate(docs, 1):
         source = Path(doc.metadata.get("source", "unknown")).name
-        page = doc.metadata.get("page", "?")
-        parts.append(f"[{i}] Source: {source}, Page {page}\n{doc.page_content.strip()}")
+        section = doc.metadata.get("page", "?")
+        parts.append(
+            f"[{i}] Source: {source}, Section: {section}\n"
+            f"{doc.page_content.strip()}"
+        )
     return "\n\n".join(parts)
 
 
-def build_rag_chain(vectorstore: Chroma | None = None):
-    """Build and return the LangChain RAG chain."""
-    if vectorstore is None:
-        vectorstore = load_vectorstore()
+# ── LLM factory ───────────────────────────────────────────────────────────────
 
+def _get_cloud_llm_and_embeddings():
+    """Instantiate OpenAI LLM + embeddings. Requires OPENAI_API_KEY."""
+    from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+    llm = ChatOpenAI(model=CONFIG.llm_model, temperature=0)
+    embeddings = OpenAIEmbeddings(model=CONFIG.embedding_model)
+    return llm, embeddings
+
+
+def _get_local_llm_and_embeddings():
+    """
+    Instantiate Ollama LLM + embeddings.
+    Connects to Ollama service at CONFIG.ollama_base_url.
+    Model runs entirely on GPU VRAM — zero system RAM overhead.
+    """
+    from langchain_ollama import ChatOllama, OllamaEmbeddings
+
+    llm = ChatOllama(
+        model=CONFIG.local_llm_model,
+        base_url=CONFIG.ollama_base_url,
+        temperature=0,
+    )
+    embeddings = OllamaEmbeddings(
+        model=CONFIG.local_embedding_model,
+        base_url=CONFIG.ollama_base_url,
+    )
+    return llm, embeddings
+
+
+# ── Chain builder ──────────────────────────────────────────────────────────────
+
+def build_rag_chain(vectorstore: Chroma, llm: Any):
+    """Build LangChain RAG chain with MMR retrieval."""
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={
@@ -212,14 +147,10 @@ def build_rag_chain(vectorstore: Chroma | None = None):
         },
     )
 
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", SYSTEM_PROMPT),
-            ("human", "{question}"),
-        ]
-    )
-
-    llm = ChatOpenAI(model=CONFIG.llm_model, temperature=0)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human", "{question}"),
+    ])
 
     chain: Any = (
         {
@@ -233,37 +164,62 @@ def build_rag_chain(vectorstore: Chroma | None = None):
     return chain, retriever
 
 
-def query(raw_question: str, chain=None, retriever=None) -> RAGResponse:
+# ── Public query API ──────────────────────────────────────────────────────────
+
+def query(
+    raw_question: str,
+    backend: str = "cloud",
+    chain: Any = None,
+    retriever: Any = None,
+) -> RAGResponse:
     """
     Run a validated question through the RAG chain.
-    Returns a RAGResponse with structured answer and sources.
+
+    Dynamically instantiates the correct LLM and embedding model based
+    on the backend parameter — no global model state maintained.
+
+    Args:
+        raw_question: The user's research question.
+        backend: "cloud" for OpenAI or "local" for Ollama.
+        chain: Optional pre-built chain (for reuse across requests).
+        retriever: Optional pre-built retriever.
+
+    Returns:
+        RAGResponse with structured answer and source citations.
 
     Raises:
         pydantic.ValidationError: if question is empty or invalid.
+        FileNotFoundError: if ChromaDB has not been built.
     """
-    # Validate input
     validated = RAGQuery(question=raw_question)
 
-    if chain is None:
-        chain, retriever = build_rag_chain()
+    if chain is None or retriever is None:
+        if backend == "cloud":
+            llm, embedding_fn = _get_cloud_llm_and_embeddings()
+        else:
+            llm, embedding_fn = _get_local_llm_and_embeddings()
 
+        vectorstore = load_vectorstore(embedding_fn)
+        chain, retriever = build_rag_chain(vectorstore, llm)
+
+    log.info(f"Query [{backend}]: {validated.question[:80]}")
     answer = chain.invoke(validated.question)
 
-    # Fetch source docs for citation panel
+    # Build structured source citations
     source_docs = retriever.invoke(validated.question)
     sources: list[SourceChunk] = []
     seen: set[str] = set()
     for doc in source_docs:
         src = Path(doc.metadata.get("source", "unknown")).name
-        page = str(doc.metadata.get("page", "?"))
-        project = doc.metadata.get("project", "nrel")
-        key = f"{src}::{page}"
+        section = str(doc.metadata.get("page", "?"))
+        project = doc.metadata.get("project", "unknown")
+        key = f"{src}::{section}"
         if key not in seen:
             seen.add(key)
             sources.append(
                 SourceChunk(
                     file=src,
-                    page=page,
+                    page=section,
                     snippet=doc.page_content[:200],
                     project=project,
                 )
@@ -273,28 +229,23 @@ def query(raw_question: str, chain=None, retriever=None) -> RAGResponse:
         question=validated.question,
         answer=answer,
         sources=sources,
+        backend=backend,
     )
 
 
-# ── CLI entrypoint ─────────────────────────────────────────────────────────────
+# ── CLI ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1 and sys.argv[1] == "ingest":
-        ingest()
-    else:
-        print("Energy RAG — interactive mode")
-        print("Type 'quit' to exit.\n")
-        chain, retriever = build_rag_chain()
-        while True:
-            q = input("Question: ").strip()
-            if q.lower() in ("quit", "exit", "q"):
-                break
-            if not q:
-                continue
-            response = query(q, chain, retriever)
-            print(f"\nAnswer:\n{response.answer}\n")
-            print("Sources:")
-            print(response.format_sources_text())
-            print()
+    print("Energy RAG — interactive mode (cloud backend)")
+    print("Type 'quit' to exit.\n")
+    while True:
+        q = input("Question: ").strip()
+        if q.lower() in ("quit", "exit", "q"):
+            break
+        if not q:
+            continue
+        response = query(q, backend="cloud")
+        print(f"\nAnswer:\n{response.answer}\n")
+        print("Sources:")
+        print(response.format_sources_text())
+        print()

@@ -1,15 +1,20 @@
 """
-Unit tests for Pydantic models in rag_pipeline.
-These run without an OpenAI key — no API calls made.
+tests/test_models.py — Unit tests for all Pydantic models.
+
+Tests import from src.models directly (canonical location).
+src.rag_pipeline re-exports these for backward compatibility.
+No API calls made — all tests run offline in CI.
 """
 
 import pytest
 from pydantic import ValidationError
 
-from src.rag_pipeline import (
+from src.models import (
+    BronzeRecord,
     PipelineConfig,
     RAGQuery,
     RAGResponse,
+    SilverRecord,
     SourceChunk,
 )
 
@@ -48,6 +53,11 @@ class TestPipelineConfig:
     def test_chunk_size_must_be_positive(self):
         with pytest.raises(ValidationError):
             PipelineConfig(chunk_size=0)
+
+    def test_local_config_defaults(self):
+        config = PipelineConfig()
+        assert config.local_llm_model == "llama3.1"
+        assert config.local_embedding_model == "nomic-embed-text"
 
 
 # ── RAGQuery ───────────────────────────────────────────────────────────────────
@@ -95,7 +105,7 @@ class TestSourceChunk:
     def test_project_tag(self):
         chunk = SourceChunk(
             file="config.md",
-            page="?",
+            page="App Config",
             snippet="energy_weight config...",
             project="routee-compass",
         )
@@ -110,25 +120,114 @@ class TestRAGResponse:
             question="What is RouteE Compass?",
             answer="RouteE Compass is an energy-aware routing tool.",
             sources=[
-                SourceChunk(file="config.md", page="?", snippet="...", project="routee-compass"),
-                SourceChunk(file="79093.pdf", page="1", snippet="...", project="nrel"),
+                SourceChunk(
+                    file="config.md",
+                    page="App Config",
+                    snippet="...",
+                    project="routee-compass",
+                ),
+                SourceChunk(
+                    file="79093.pdf",
+                    page="1",
+                    snippet="...",
+                    project="nrel",
+                ),
             ],
         )
 
     def test_source_count(self):
-        response = self._make_response()
-        assert response.source_count == 2
+        assert self._make_response().source_count == 2
 
     def test_format_sources_text(self):
-        response = self._make_response()
-        text = response.format_sources_text()
+        text = self._make_response().format_sources_text()
         assert "config.md" in text
         assert "79093.pdf" in text
         assert "routee-compass" in text
 
     def test_empty_sources(self):
-        response = RAGResponse(
-            question="test", answer="no sources", sources=[]
-        )
+        response = RAGResponse(question="test", answer="no sources", sources=[])
         assert response.source_count == 0
         assert response.format_sources_text() == ""
+
+    def test_backend_default(self):
+        response = RAGResponse(question="test", answer="ans", sources=[])
+        assert response.backend == "cloud"
+
+    def test_backend_local(self):
+        response = RAGResponse(
+            question="test", answer="ans", sources=[], backend="local"
+        )
+        assert response.backend == "local"
+
+
+# ── BronzeRecord ───────────────────────────────────────────────────────────────
+
+class TestBronzeRecord:
+    def test_valid_bronze_record(self):
+        record = BronzeRecord(
+            source_file="report.pdf",
+            source_path="/data/pdfs/report.pdf",
+            file_hash="abc123",
+            content_markdown="# Report\nContent here.",
+            page_count=10,
+            file_type="pdf",
+            project="nrel",
+            parsed_at=1234567890.0,
+        )
+        assert record.source_file == "report.pdf"
+
+    def test_negative_page_count_fails(self):
+        with pytest.raises(ValidationError):
+            BronzeRecord(
+                source_file="f.pdf",
+                source_path="/f.pdf",
+                file_hash="abc",
+                content_markdown="content",
+                page_count=-1,
+                file_type="pdf",
+                project="nrel",
+                parsed_at=0.0,
+            )
+
+
+# ── SilverRecord ───────────────────────────────────────────────────────────────
+
+class TestSilverRecord:
+    def test_valid_silver_record(self):
+        record = SilverRecord(
+            source_file="config.md",
+            project="routee-compass",
+            file_type="markdown",
+            section="App Config",
+            chunk_index=0,
+            chunk_text="The config file specifies which traversal model to use.",
+            file_hash="def456",
+            chunk_id="def456_0000",
+        )
+        assert record.section == "App Config"
+
+    def test_empty_chunk_text_fails(self):
+        with pytest.raises(ValidationError):
+            SilverRecord(
+                source_file="f.md",
+                project="p",
+                file_type="markdown",
+                section="s",
+                chunk_index=0,
+                chunk_text="",
+                file_hash="abc",
+                chunk_id="abc_0000",
+            )
+
+    def test_negative_chunk_index_fails(self):
+        with pytest.raises(ValidationError):
+            SilverRecord(
+                source_file="f.md",
+                project="p",
+                file_type="markdown",
+                section="s",
+                chunk_index=-1,
+                chunk_text="some text",
+                file_hash="abc",
+                chunk_id="abc_0000",
+            )

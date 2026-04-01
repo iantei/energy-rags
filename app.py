@@ -1,153 +1,241 @@
 """
-Energy Policy RAG — Gradio Interface (Gradio 6 compatible)
+app.py — Gradio UI with dynamic Cloud / Local LLM toggle.
+
+Design principles:
+    - No global LLM instantiation — models created per query based on
+      the dropdown selection. Avoids holding both backends in memory
+      simultaneously (important on 16GB RAM / 8GB VRAM hardware).
+    - ChromaDB validity check on startup — surfaces a clear setup message
+      if ingestion hasn't been run yet.
+    - Pydantic validation via src.rag_pipeline.query() — invalid inputs
+      return structured error messages rather than crashing.
 """
 
+import logging
+
 import gradio as gr
-from pathlib import Path
-from pydantic import ValidationError
-from src.rag_pipeline import build_rag_chain, query, ingest, CHROMA_DIR, DATA_DIR
 
-_chain = None
-_retriever = None
+from src.rag_pipeline import CONFIG, query, vectorstore_ready
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("app")
+
+# ── Backend mapping ────────────────────────────────────────────────────────────
+
+BACKEND_OPTIONS = {
+    "☁️  Cloud (OpenAI GPT-4o-mini)": "cloud",
+    "🖥️  Local Air-Gapped (Ollama llama3.1)": "local",
+}
 
 
-def ensure_chain():
-    global _chain, _retriever
-    if _chain is None:
-        if not CHROMA_DIR.exists():
-            return False
-        _chain, _retriever = build_rag_chain()
-    return True
+def _backend_key(choice: str) -> str:
+    return BACKEND_OPTIONS.get(choice, "cloud")
 
 
-def format_sources_md(response) -> str:
+# ── Gradio helpers ─────────────────────────────────────────────────────────────
+
+def _format_sources_md(response) -> str:
     if not response.sources:
         return "_No sources retrieved._"
-    lines = ["| # | Document | Page | Project | Snippet |",
-             "|---|----------|------|---------|---------|"]
+    lines = [
+        "| # | Document | Section | Project | Snippet |",
+        "|---|----------|---------|---------|---------|",
+    ]
     for i, s in enumerate(response.sources, 1):
         snippet = s.snippet.replace("\n", " ").replace("|", "/")[:100] + "..."
-        lines.append(f"| {i} | `{s.file}` | {s.page} | {s.project} | {snippet} |")
+        lines.append(
+            f"| {i} | `{s.file}` | {s.page} | {s.project} | {snippet} |"
+        )
     return "\n".join(lines)
 
 
-def run_ingest(pdf_dir_str):
-    pdf_dir = Path(pdf_dir_str.strip()) if pdf_dir_str.strip() else DATA_DIR
-    if not pdf_dir.exists():
-        return f"Directory not found: {pdf_dir}"
-    try:
-        ingest(pdf_dir)
-        global _chain, _retriever
-        _chain, _retriever = build_rag_chain()
-        pdf_count = len(list(pdf_dir.glob("*.pdf")))
-        return f"Ingested {pdf_count} PDF(s) from {pdf_dir}. Ready to query."
-    except Exception as e:
-        return f"Ingestion error: {e}"
+# ── Gradio callback ────────────────────────────────────────────────────────────
 
-
-def ask_question(question, history):
+def ask_question(
+    question: str,
+    llm_choice: str,
+    history: list,
+) -> tuple:
     history = history or []
+
     if not question.strip():
-        return history, "", "_Please enter a question._"
+        return history, "", "_Please enter a question._", "_Ready_"
 
-    if not ensure_chain():
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": "No vector store found. Please ingest PDFs first using the Setup tab."})
-        return history, "", "_Run ingestion first._"
-
-    try:
-        response = query(question, _chain, _retriever)
-        history.append({"role": "user", "content": response.question})
-        history.append({"role": "assistant", "content": response.answer})
-        return history, "", format_sources_md(response)
-    except ValidationError as e:
-        msg = f"Invalid input: {e.errors()[0]['msg']}"
+    if not vectorstore_ready():
+        msg = (
+            "⚠️ No vector store found. "
+            "Run `python ingest_routee.py` to build the corpus first, "
+            "or use the Setup tab instructions."
+        )
         history.append({"role": "user", "content": question})
         history.append({"role": "assistant", "content": msg})
-        return history, "", "_Validation error._"
-    except Exception as e:
-        history.append({"role": "user", "content": question})
-        history.append({"role": "assistant", "content": f"Error: {e}"})
-        return history, "", "_Error retrieving sources._"
+        return history, "", "_Run ingestion first._", "⚠️ No corpus"
 
+    backend = _backend_key(llm_choice)
+
+    try:
+        response = query(question, backend=backend)
+        history.append({"role": "user", "content": response.question})
+        history.append({"role": "assistant", "content": response.answer})
+        sources_md = _format_sources_md(response)
+        status = (
+            f"✅ {response.source_count} source(s) · "
+            f"**{llm_choice.split('(')[1].rstrip(')')}**"
+        )
+        return history, "", sources_md, status
+
+    except ConnectionError:
+        msg = (
+            f"❌ Cannot reach Ollama at `{CONFIG.ollama_base_url}`. "
+            "Start the service: `docker compose up ollama` "
+            "or `ollama serve` locally."
+        )
+        log.error("Ollama connection error")
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": msg})
+        return history, "", "_Connection error._", "❌ Ollama unreachable"
+
+    except Exception as exc:
+        log.error(f"Query error: {exc}", exc_info=True)
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": f"❌ {type(exc).__name__}: {exc}"})
+        return history, "", "_An error occurred._", f"❌ {type(exc).__name__}"
+
+
+# ── UI layout ──────────────────────────────────────────────────────────────────
 
 with gr.Blocks(title="Energy Policy RAG Assistant") as demo:
 
     gr.Markdown("""
-    # Energy Policy RAG Assistant
+    # 🔋 Energy Policy RAG Assistant
     **Ask research questions over NREL & DOE technical reports and RouteE Compass docs.**
-    Powered by OpenAI embeddings + ChromaDB + GPT-4o-mini. Schema validated with Pydantic.
+
+    Medallion ETL (Bronze/Silver/Gold) · Pydantic schema validation · Cloud or Local inference
     """)
 
     with gr.Tabs():
 
-        with gr.Tab("Ask a Question"):
+        with gr.Tab("💬 Ask a Question"):
             with gr.Row():
+
                 with gr.Column(scale=3):
-                    chatbot = gr.Chatbot(label="Conversation", height=460)
+                    chatbot = gr.Chatbot(label="Conversation", height=480)
+
                     with gr.Row():
                         question_box = gr.Textbox(
-                            placeholder="e.g. How do I configure energy weights in RouteE Compass?",
+                            placeholder=(
+                                "e.g. How does RouteE Compass handle "
+                                "battery state for EVs?"
+                            ),
                             label="Your question",
                             lines=2,
                             scale=5,
                         )
                         ask_btn = gr.Button("Ask", variant="primary", scale=1)
 
+                    with gr.Row():
+                        llm_dropdown = gr.Dropdown(
+                            choices=list(BACKEND_OPTIONS.keys()),
+                            value=list(BACKEND_OPTIONS.keys())[0],
+                            label="Inference Backend",
+                            info=(
+                                "Cloud: OpenAI API (best quality, requires key). "
+                                "Local: Ollama on GPU (air-gapped, free)."
+                            ),
+                            scale=3,
+                        )
+                        status_box = gr.Markdown("_Ready_", scale=2)
+
                 with gr.Column(scale=2):
-                    gr.Markdown("### Retrieved Sources")
-                    sources_display = gr.Markdown("_Sources will appear here after your first query._")
+                    gr.Markdown("### 📄 Retrieved Sources")
+                    sources_display = gr.Markdown(
+                        "_Sources will appear here after your first query._"
+                    )
 
             history_state = gr.State([])
 
             ask_btn.click(
                 ask_question,
-                inputs=[question_box, history_state],
-                outputs=[chatbot, question_box, sources_display],
+                inputs=[question_box, llm_dropdown, history_state],
+                outputs=[chatbot, question_box, sources_display, status_box],
             )
             question_box.submit(
                 ask_question,
-                inputs=[question_box, history_state],
-                outputs=[chatbot, question_box, sources_display],
+                inputs=[question_box, llm_dropdown, history_state],
+                outputs=[chatbot, question_box, sources_display, status_box],
             )
 
-        with gr.Tab("Setup / Ingest"):
-            gr.Markdown("""
-            ### Ingest PDF Reports
-            1. Place NREL or DOE PDF reports in `data/pdfs/`
-            2. Optionally specify a custom directory below
-            3. Click **Ingest PDFs**
-            """)
-            with gr.Row():
-                pdf_dir_input = gr.Textbox(
-                    label="PDF directory (leave blank for default data/pdfs/)",
-                    placeholder=str(DATA_DIR),
-                    scale=4,
-                )
-                ingest_btn = gr.Button("Ingest PDFs", variant="primary", scale=1)
-            ingest_status = gr.Textbox(label="Status", interactive=False, lines=3)
-            ingest_btn.click(run_ingest, inputs=[pdf_dir_input], outputs=[ingest_status])
+        with gr.Tab("⚙️ Setup"):
+            gr.Markdown(f"""
+            ### Quick Start
 
-        with gr.Tab("About"):
+            **Option 1 — Docker (recommended for Local backend)**
+            ```bash
+            # Start all services (app + Ollama with GPU passthrough)
+            docker compose up -d
+
+            # Pull local models into Ollama (first time, ~8GB)
+            docker exec -it ollama ollama pull llama3.1
+            docker exec -it ollama ollama pull nomic-embed-text
+
+            # Run ingestion pipeline
+            docker exec -it energy-rag python ingest_routee.py --workers 4
+            ```
+
+            **Option 2 — Local virtualenv (Cloud backend only)**
+            ```bash
+            ./run.sh   # handles venv activation + API key export
+            ```
+
+            **Ingestion options**
+            ```bash
+            python ingest_routee.py              # Full Bronze → Silver → Gold
+            python ingest_routee.py --workers 4  # Parallel PDF parsing
+            python ingest_routee.py --from-silver  # Re-chunk only (skip PDF parse)
+            python ingest_routee.py --from-gold    # Re-embed only
+            ```
+
+            **Current config**
+            - Cloud LLM: `{CONFIG.llm_model}` · Embeddings: `{CONFIG.embedding_model}`
+            - Local LLM: `{CONFIG.local_llm_model}` · Embeddings: `{CONFIG.local_embedding_model}`
+            - Ollama URL: `{CONFIG.ollama_base_url}`
+            - Chunk size: {CONFIG.chunk_size} · Overlap: {CONFIG.chunk_overlap}
+            - Retriever k: {CONFIG.retriever_k} (MMR, fetch_k={CONFIG.retriever_fetch_k})
+            """)
+
+        with gr.Tab("ℹ️ Architecture"):
             gr.Markdown("""
-            ### Architecture
+            ### ETL Pipeline (Medallion Architecture)
             ```
-            PDFs + Markdown -> PyPDFLoader/TextLoader -> RecursiveCharacterTextSplitter
-                            -> OpenAI text-embedding-3-small -> ChromaDB (local)
-                            -> MMR Retriever (k=5) -> GPT-4o-mini
-                            -> Pydantic RAGResponse -> Answer + Citations
+            PDFs + Markdown/Python source files
+              └── Bronze: Docling (layout-aware) + PyPDF fallback
+                    └── raw_reports.parquet
+                          └── Silver: MarkdownHeaderTextSplitter + section tagging
+                                └── chunked_reports.parquet
+                                      └── Gold: OpenAI embeddings → ChromaDB
+                                            └── MMR Retriever → LLM → RAGResponse
             ```
-            ### Stack
-            - **LangChain** — orchestration
-            - **ChromaDB** — local persistent vector store
-            - **OpenAI** — embeddings + LLM (GPT-4o-mini)
-            - **Pydantic** — query validation and response schema enforcement
-            - **Gradio** — UI
-            ### Corpus
-            - NREL technical reports (PDF)
-            - RouteE Compass documentation (Markdown + Python examples)
+
+            ### Key Design Decisions
+            - **No global LLM**: instantiated per-query, avoids holding Cloud + Local
+              in memory simultaneously on 16GB RAM hardware
+            - **Parquet checkpoints**: each ETL layer persists independently,
+              enabling `--from-silver` and `--from-gold` re-runs
+            - **Pydantic everywhere**: `PipelineConfig`, `RAGQuery`, `RAGResponse`,
+              `BronzeRecord`, `SilverRecord` — all schema-validated
+            - **ProcessPoolExecutor**: PDF parsing parallelised across CPU cores,
+              mirroring HPC batch processing patterns from NREL
             """)
 
 
 if __name__ == "__main__":
-    demo.launch(share=False, show_error=True)
+    demo.launch(
+        server_name="0.0.0.0",  # Bind to all interfaces for Docker
+        server_port=7860,
+        show_error=True,
+    )

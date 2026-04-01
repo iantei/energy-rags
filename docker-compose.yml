@@ -1,0 +1,85 @@
+# ── Energy Policy RAG — Docker Compose ────────────────────────────────────────
+# Services:
+#   energy-rag  — Python app (Gradio UI + ingestion)
+#   ollama      — Local LLM inference with NVIDIA GPU passthrough
+#
+# Hardware allocation (16GB RAM / RTX 4070 8GB VRAM):
+#   Ollama:     runs entirely on GPU VRAM (llama3.1 8B ≈ 6GB)
+#   energy-rag: uses system RAM for Polars ETL + ChromaDB
+#
+# First-time setup:
+#   docker compose up -d
+#   docker exec -it ollama ollama pull llama3.1
+#   docker exec -it ollama ollama pull nomic-embed-text
+#   docker exec -it energy-rag python ingest_routee.py --workers 4
+
+version: "3.9"
+
+services:
+
+  energy-rag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: energy-rag
+    ports:
+      - "7860:7860"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - POLARS_MAX_THREADS=4
+    volumes:
+      - ./data:/app/data
+      - /mnt/c/Users/peace/Documents/RouteE/routee-compass/docs:/app/routee_docs:ro
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 10G
+    networks:
+      - rag-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    # ── NVIDIA GPU Passthrough ─────────────────────────────────────────────────
+    # Passes RTX 4070 (8GB VRAM) to Ollama container.
+    # llama3.1 (8B) fully offloads to GPU — zero system RAM for inference.
+    # Prereq: NVIDIA Container Toolkit installed on host.
+    # Verify: docker exec ollama nvidia-smi
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities:
+                - gpu
+                - utility
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - rag-network
+
+volumes:
+  ollama-models:
+    driver: local
+
+networks:
+  rag-network:
+    driver: bridge
